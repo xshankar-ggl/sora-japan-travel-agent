@@ -1,0 +1,47 @@
+# Google Cloud Build CI/CD pipeline for Sora Japan Travel Agent
+steps:
+  # Step 1: Run automated regression & evaluation test suite
+  - name: "python:3.11-slim"
+    id: "unit-and-eval-tests"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - |
+        pip install --no-cache-dir -r requirements.txt
+        pytest -v
+
+  # Step 2: Build container image
+  - name: "gcr.io/cloud-builders/docker"
+    id: "build-image"
+    args:
+      - "build"
+      - "-t"
+      - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/sora-agent-repo/sora-japan-travel-agent:${SHORT_SHA}"
+      - "."
+
+  # Step 3: Push container image to Artifact Registry
+  - name: "gcr.io/cloud-builders/docker"
+    id: "push-image"
+    args:
+      - "push"
+      - "${_REGION}-docker.pkg.dev/${PROJECT_ID}/sora-agent-repo/sora-japan-travel-agent:${SHORT_SHA}"
+
+  # Step 4: Deploy to Cloud Run with Google Cloud Secret Manager binding
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    id: "deploy-cloud-run"
+    entrypoint: "gcloud"
+    args:
+      - "run"
+      - "deploy"
+      - "sora-japan-travel-agent"
+      - "--image=${_REGION}-docker.pkg.dev/${PROJECT_ID}/sora-agent-repo/sora-japan-travel-agent:${SHORT_SHA}"
+      - "--region=${_REGION}"
+      - "--platform=managed"
+      - "--set-secrets=GEMINI_API_KEY=sora-gemini-api-key:latest"
+      - "--set-env-vars=GCP_PROJECT_ID=${PROJECT_ID},SORA_GEMINI_SECRET_ID=sora-gemini-api-key"
+
+substitutions:
+  _REGION: "us-central1"
+
+options:
+  logging: CLOUD_LOGGING_ONLY

@@ -1,0 +1,49 @@
+name: Sora Agent CI/CD & Evaluation Pipeline
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test-and-evaluate:
+    name: Automated Pytest & Agent Evaluation Suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run Pytest Regression & Agent Evaluation Suite
+        run: |
+          pytest -v
+
+  validate-terraform:
+    name: Validate Terraform IaC
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+
+      - name: Terraform Format Check & Validate
+        working-directory: ./terraform
+        run: |
+          terraform fmt -check
+          terraform init -backend=false
+          terraform validate

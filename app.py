@@ -7,24 +7,51 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-from sora_agent.agent import SORA_ROLE_HEADER, run_sora_query
+from sora_agent.agent import SORA_ROLE_HEADER, arun_sora_query
+from sora_agent.hitl import ConfirmationDecisionOutput, hitl_manager
+from sora_agent.memory import CompactedHistorySummary, SessionStateModel, session_memory_manager
+from sora_agent.observability import intent_tracker, pii_redactor, structured_logger, tracer
+from sora_agent.schemas import (
+    CulturalEtiquetteOutput,
+    HighStakesBookingOutput,
+    ICCardTransitGuideOutput,
+    JRPassCalculationOutput,
+    RailVsAirComparisonOutput,
+    SeasonalTravelGuideOutput,
+)
 from sora_agent.tools import (
     calculate_jr_pass_value,
     compare_rail_vs_air,
     get_cultural_etiquette_and_logistics,
     get_ic_card_and_transit_guide,
     get_seasonal_travel_guide,
+    request_high_stakes_booking_confirmation,
+    resolve_booking_confirmation,
 )
 
 app = FastAPI(
     title="Sora — Japan-Specialist Travel Planning Agent",
     description=SORA_ROLE_HEADER,
-    version="1.0.0",
+    version="2.0.0",
 )
 
 
 class ChatRequest(BaseModel):
     prompt: str = Field(..., min_length=1, description="Traveler request or itinerary prompt for Sora.")
+    session_id: str = Field(default="default", description="Persistent conversation session ID.")
+
+
+class ChatResponse(BaseModel):
+    prompt: str
+    session_id: str
+    response: str
+
+
+class HealthResponse(BaseModel):
+    status: str
+    agent: str
+    specialty: str
+    version: str
 
 
 class JRPassRequest(BaseModel):
@@ -36,19 +63,39 @@ class JRPassRequest(BaseModel):
     pass_class: str = Field(default="ordinary", description="ordinary or green.")
 
 
-@app.get("/api/health")
-def health_check() -> dict[str, str]:
-    return {"status": "ok", "agent": "Sora", "specialty": "Japan Travel Planning"}
+class HITLStageRequest(BaseModel):
+    action_type: str = Field(default="BOOK_RYOKAN_KAISEKI")
+    item_description: str = Field(..., min_length=3)
+    estimated_total_jpy: int = Field(..., ge=0)
+    traveler_count: int = Field(default=1, ge=1)
+    non_refundable: bool = Field(default=True)
 
 
-@app.post("/api/chat")
-def chat_with_sora(req: ChatRequest) -> dict[str, str]:
-    reply = run_sora_query(req.prompt)
-    return {"prompt": req.prompt, "response": reply}
+class HITLConfirmRequest(BaseModel):
+    confirmation_id: str = Field(..., min_length=3)
+    approved: bool = Field(...)
+    reviewer_id: str = Field(default="human_traveler")
+    reviewer_note: str = Field(default="")
 
 
-@app.post("/api/jr-pass")
-def evaluate_jr_pass(req: JRPassRequest) -> dict:
+@app.get("/api/health", response_model=HealthResponse)
+async def health_check() -> HealthResponse:
+    return HealthResponse(
+        status="ok",
+        agent="Sora",
+        specialty="Japan Travel Planning",
+        version="2.0.0",
+    )
+
+
+@app.post("/api/chat", response_model=ChatResponse)
+async def chat_with_sora(req: ChatRequest) -> ChatResponse:
+    reply = await arun_sora_query(req.prompt, session_id=req.session_id)
+    return ChatResponse(prompt=req.prompt, session_id=req.session_id, response=reply)
+
+
+@app.post("/api/jr-pass", response_model=JRPassCalculationOutput)
+async def evaluate_jr_pass(req: JRPassRequest) -> JRPassCalculationOutput:
     return calculate_jr_pass_value(
         legs=req.legs,
         duration_days=req.duration_days,
@@ -56,30 +103,73 @@ def evaluate_jr_pass(req: JRPassRequest) -> dict:
     )
 
 
-@app.get("/api/rail-vs-air")
-def rail_vs_air_endpoint(
+@app.get("/api/rail-vs-air", response_model=RailVsAirComparisonOutput)
+async def rail_vs_air_endpoint(
     origin: str = Query("Tokyo"),
     destination: str = Query("Fukuoka"),
-) -> dict:
+) -> RailVsAirComparisonOutput:
     return compare_rail_vs_air(origin=origin, destination=destination)
 
 
-@app.get("/api/season/{month}")
-def season_endpoint(month: int) -> dict:
+@app.get("/api/season/{month}", response_model=SeasonalTravelGuideOutput)
+async def season_endpoint(month: int) -> SeasonalTravelGuideOutput:
     return get_seasonal_travel_guide(month=month)
 
 
-@app.get("/api/etiquette/{topic}")
-def etiquette_endpoint(topic: str = "all") -> dict:
+@app.get("/api/etiquette/{topic}", response_model=CulturalEtiquetteOutput)
+async def etiquette_endpoint(topic: str = "all") -> CulturalEtiquetteOutput:
     return get_cultural_etiquette_and_logistics(topic=topic)
 
 
-@app.get("/api/ic-guide")
-def ic_guide_endpoint(
+@app.get("/api/ic-guide", response_model=ICCardTransitGuideOutput)
+async def ic_guide_endpoint(
     airport: str = Query("HND"),
     has_iphone: bool = Query(True),
-) -> dict:
+) -> ICCardTransitGuideOutput:
     return get_ic_card_and_transit_guide(arrival_airport=airport, has_iphone=has_iphone)
+
+
+@app.get("/api/session/{session_id}", response_model=SessionStateModel)
+async def get_session_endpoint(session_id: str) -> SessionStateModel:
+    return await session_memory_manager.aget_session_state(session_id=session_id)
+
+
+@app.post("/api/session/{session_id}/compact", response_model=CompactedHistorySummary)
+async def compact_session_endpoint(session_id: str) -> CompactedHistorySummary:
+    return await session_memory_manager.acompact_session_history(session_id=session_id, force=True)
+
+
+@app.post("/api/hitl/stage", response_model=HighStakesBookingOutput)
+async def stage_hitl_booking(req: HITLStageRequest) -> HighStakesBookingOutput:
+    return request_high_stakes_booking_confirmation(
+        action_type=req.action_type,
+        item_description=req.item_description,
+        estimated_total_jpy=req.estimated_total_jpy,
+        traveler_count=req.traveler_count,
+        non_refundable=req.non_refundable,
+    )
+
+
+@app.post("/api/hitl/confirm", response_model=ConfirmationDecisionOutput)
+async def confirm_hitl_booking(req: HITLConfirmRequest) -> ConfirmationDecisionOutput:
+    return resolve_booking_confirmation(
+        confirmation_id=req.confirmation_id,
+        approved=req.approved,
+        reviewer_id=req.reviewer_id,
+        reviewer_note=req.reviewer_note,
+    )
+
+
+@app.get("/api/observability/metrics")
+async def observability_metrics_endpoint() -> dict[str, object]:
+    return {
+        "intent_vs_outcome": intent_tracker.get_metrics_summary(),
+        "total_pii_redactions": pii_redactor.total_redactions,
+        "recorded_spans_count": len(tracer.completed_spans),
+        "structured_logs_count": len(structured_logger.entries),
+        "pending_hitl_actions": [p.model_dump() for p in hitl_manager.list_pending_actions()],
+    }
+
 
 
 INDEX_HTML = """<!DOCTYPE html>

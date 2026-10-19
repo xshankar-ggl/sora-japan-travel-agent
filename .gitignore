@@ -12,6 +12,17 @@ env/
 .env
 .env.local
 
+# Local runtime SQLite session & vector database
+.sora_data/
+*.db
+*.db-shm
+*.db-wal
+
+# Terraform local state & provider binaries
+.terraform/
+*.tfstate
+*.tfstate.*
+
 # Distribution / packaging
 dist/
 build/

@@ -4,18 +4,21 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sora-japan-travel-agent"
-version = "1.0.0"
-description = "Sora: A Japan-specialist travel planning AI agent built with Google ADK and Gemini."
+version = "2.0.0"
+description = "Sora: A multi-agent Japan-specialist travel planning AI system built with Google ADK, Gemini, OpenTelemetry, and GCP Secret Manager."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
     { name = "Sora Agent Contributors" }
 ]
-keywords = ["japan", "travel", "itinerary", "agent", "google-adk", "gemini", "jr-pass"]
+keywords = ["japan", "travel", "itinerary", "agent", "google-adk", "gemini", "jr-pass", "opentelemetry", "terraform"]
 dependencies = [
     "google-adk>=1.0.0",
     "google-genai>=1.0.0",
+    "google-cloud-secret-manager>=2.20.0",
+    "opentelemetry-api>=1.24.0",
+    "opentelemetry-sdk>=1.24.0",
     "fastapi>=0.110.0",
     "uvicorn>=0.27.0",
     "pydantic>=2.6.0",
@@ -26,6 +29,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
     "httpx>=0.27.0",
 ]
 

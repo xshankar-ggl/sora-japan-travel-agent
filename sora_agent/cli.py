@@ -40,7 +40,8 @@ def _print_markdown(text: str, title: str | None = None) -> None:
 
 
 def _print_json(data: object, title: str) -> None:
-    formatted = json.dumps(data, indent=2, ensure_ascii=False)
+    serializable = data.model_dump() if hasattr(data, "model_dump") else data
+    formatted = json.dumps(serializable, indent=2, ensure_ascii=False)
     if HAS_RICH and _CONSOLE is not None:
         _CONSOLE.print(Panel(formatted, title=title, border_style="cyan"))
     else:

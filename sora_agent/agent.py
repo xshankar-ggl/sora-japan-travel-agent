@@ -1,22 +1,45 @@
-"""Google ADK Agent definition and execution engine for Sora."""
+"""Google ADK Multi-Agent Coordinator, Async Execution Engine, Strategic Router, and Guardrail Pipeline for Sora."""
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
-from dataclasses import dataclass, field
-from typing import Any, Callable
+import time
+from typing import Any
 
+from sora_agent.guardrails import (
+    get_cloud_native_safety_settings,
+    guardrail_engine,
+)
+from sora_agent.hitl import hitl_manager
+from sora_agent.memory import (
+    PersistentSessionMemoryManager,
+    session_memory_manager,
+)
+from sora_agent.observability import (
+    intent_tracker,
+    structured_logger,
+    trace_span,
+    tracer,
+)
+from sora_agent.orchestration import (
+    AdkAgent,
+    MODEL_TIER_STANDARD,
+    _instantiate_adk_agent,
+    create_specialist_sub_agents,
+    model_router,
+)
 from sora_agent.prompt import SORA_ROLE_HEADER, SORA_SYSTEM_PROMPT
+from sora_agent.secrets import secret_manager_service
 from sora_agent.tools import (
     ALL_SORA_TOOLS,
-    calculate_jr_pass_value,
     check_japan_destination_scope,
     compare_rail_vs_air,
     generate_day_by_day_itinerary_template,
     get_cultural_etiquette_and_logistics,
     get_ic_card_and_transit_guide,
-    get_seasonal_travel_guide,
+    request_high_stakes_booking_confirmation,
 )
 
 try:
@@ -26,39 +49,26 @@ try:
 except ImportError:
     pass
 
-DEFAULT_MODEL = os.getenv("SORA_MODEL", "gemini-2.5-flash")
-
-# Try importing Google ADK Agent; provide a compatible fallback class if google-adk is not installed
-try:
-    from google.adk.agents import Agent as AdkAgent  # type: ignore[import-untyped]
-
-    HAS_GOOGLE_ADK = True
-except ImportError:
-    HAS_GOOGLE_ADK = False
-
-    @dataclass
-    class AdkAgent:  # type: ignore[no-redef]
-        """Fallback Agent representation matching google.adk.agents.Agent interface."""
-
-        name: str
-        model: str
-        description: str
-        instruction: str
-        tools: list[Callable[..., Any]] = field(default_factory=list)
+DEFAULT_MODEL = os.getenv("SORA_MODEL", MODEL_TIER_STANDARD)
 
 
 def create_sora_agent(model: str = DEFAULT_MODEL) -> AdkAgent:
-    """Creates and returns the Sora Google ADK root_agent instance."""
-    return AdkAgent(
+    """Creates and returns the hierarchical Sora Google ADK `root_agent` Coordinator with 4 specialist sub-agents."""
+    sub_agents_map = create_specialist_sub_agents()
+    return _instantiate_adk_agent(
         name="sora_japan_travel_agent",
         model=model,
         description=(
-            "Sora: A Japan-specialist travel planning agent that designs day-by-day Japan "
-            "itineraries with JR Pass math, IC card guidance, ryokan etiquette, konbini culture, "
-            "seasonal advice, and regional rail vs. domestic air comparisons."
+            "Sora: A multi-agent Japan-specialist travel planning coordinator that orchestrates "
+            "specialist sub-agents for post-2023 JR Pass math, IC card guidance, ryokan etiquette, "
+            "konbini culture, seasonal advice, rail vs. domestic air comparisons, and HITL bookings."
         ),
         instruction=SORA_SYSTEM_PROMPT,
         tools=ALL_SORA_TOOLS,
+        sub_agents=list(sub_agents_map.values()),
+        before_model_callback=guardrail_engine.adk_before_model_callback,
+        after_model_callback=guardrail_engine.adk_after_model_callback,
+        before_tool_callback=hitl_manager.adk_before_tool_callback,
     )
 
 
@@ -124,29 +134,49 @@ def _extract_month_from_prompt(prompt: str) -> int:
     return 4
 
 
-def render_tool_assisted_response(prompt: str) -> str:
-    """Synthesizes a comprehensive Japan-specialist response using Sora's tools.
+@trace_span("sora.agent.render_tool_assisted_response", component="agent")
+def render_tool_assisted_response(
+    prompt: str,
+    *,
+    memory_context_summary: str = "",
+) -> str:
+    """Synthesizes a comprehensive Japan-specialist response by coordinating Sora's specialist tools."""
+    input_eval = guardrail_engine.evaluate_input(prompt)
+    if not input_eval.allowed:
+        return input_eval.guardrail_message
 
-    Used both as a reliable fallback when GEMINI_API_KEY is not configured and as a
-    deterministic structured response generator.
-    """
-    scope = check_japan_destination_scope(prompt)
-    detected_japan_cities = _extract_cities_from_prompt(prompt)
+    sanitized_prompt = input_eval.sanitized_prompt
+    lowered = sanitized_prompt.lower()
 
-    if not scope["is_japan_only"] and not detected_japan_cities:
-        non_jp = ", ".join(scope["detected_non_japan_destinations"])
+    # Check if the traveler is requesting a high-stakes booking commitment (HITL Gate)
+    if any(
+        kw in lowered
+        for kw in ("book now", "confirm booking", "purchase jr pass", "reserve ryokan", "commit reservation")
+    ):
+        action_type = "PURCHASE_JR_PASS" if "jr pass" in lowered else "BOOK_RYOKAN_KAISEKI"
+        cost_jpy = 50000 if action_type == "PURCHASE_JR_PASS" else 68000
+        hitl_res = request_high_stakes_booking_confirmation(
+            action_type=action_type,
+            item_description=f"Traveler requested commitment: {sanitized_prompt[:120]}",
+            estimated_total_jpy=cost_jpy,
+            traveler_count=1,
+            non_refundable=True,
+        )
         return (
-            f"Konnichiwa! I am **Sora**, a dedicated **Japan-specialist travel planning agent**.\n\n"
-            f"I noticed your request mentions **{non_jp}**. Because I specialize exclusively in Japan—covering "
-            f"Shinkansen & JR Pass mechanics, Suica/PASMO/ICOCA transit, ryokan & onsen etiquette, konbini culture, "
-            f"and regional Japan itineraries—I don't plan trips outside Japan.\n\n"
-            f"If you'd like to plan a trip to **Japan** (such as Tokyo, Kyoto, Osaka, Hiroshima, Kanazawa, Hokkaido, "
-            f"or Kyushu), tell me your travel dates, trip length, and interests, and I'll craft a complete day-by-day "
-            f"itinerary for you!"
+            f"# 🛑 Human-in-the-Loop Confirmation Required (`{hitl_res.confirmation_id}`)\n\n"
+            f"Konnichiwa! I am **Sora**, your Japan-specialist travel planning agent.\n\n"
+            f"- **Action Staged**: `{hitl_res.action_type}`\n"
+            f"- **Item**: {hitl_res.item_description}\n"
+            f"- **Estimated Cost**: **¥{hitl_res.estimated_total_jpy:,}**\n"
+            f"- **Policy Warning**: {hitl_res.cancellation_policy_warning}\n\n"
+            f"> **Next Step**: {hitl_res.approval_instructions}"
         )
 
-    days = _extract_days_from_prompt(prompt)
-    month = _extract_month_from_prompt(prompt)
+    scope = check_japan_destination_scope(sanitized_prompt)
+    detected_japan_cities = _extract_cities_from_prompt(sanitized_prompt)
+
+    days = _extract_days_from_prompt(sanitized_prompt)
+    month = _extract_month_from_prompt(sanitized_prompt)
     cities = detected_japan_cities or (["tokyo", "hakone", "kyoto", "osaka"] if days >= 7 else ["tokyo", "kyoto"])
 
     template = generate_day_by_day_itinerary_template(days=days, cities=cities, month=month)
@@ -161,6 +191,14 @@ def render_tool_assisted_response(prompt: str) -> str:
         "itinerary with post-2023 JR Pass math, IC card setup, luggage forwarding checkpoints, konbini picks, and "
         "cultural etiquette built right in.",
     ]
+
+    if memory_context_summary:
+        sections.extend(
+            [
+                "",
+                "> **Session Memory Active**: Personalized using your stored session profile and semantic travel preferences.",
+            ]
+        )
 
     if not scope["is_japan_only"]:
         non_jp = ", ".join(scope["detected_non_japan_destinations"])
@@ -269,52 +307,211 @@ def render_tool_assisted_response(prompt: str) -> str:
         ]
     )
 
-    return "\n".join(sections)
+    draft_text = "\n".join(sections)
+    self_eval = guardrail_engine.self_evaluate_and_refine(
+        sanitized_prompt,
+        draft_text,
+        is_itinerary_request=True,
+    )
+    return self_eval.refined_response
 
 
-def run_sora_query(prompt: str, model: str = DEFAULT_MODEL, prefer_live_api: bool = True) -> str:
-    """Runs a user travel planning prompt through Sora.
+async def arun_sora_query(
+    prompt: str,
+    *,
+    session_id: str = "default",
+    model: str | None = None,
+    prefer_live_api: bool = True,
+    memory_manager: PersistentSessionMemoryManager | None = None,
+) -> str:
+    """Asynchronously executes a traveler query with multi-agent routing, persistent memory, guardrails, and tracing."""
+    start_perf = time.perf_counter()
+    mem = memory_manager or session_memory_manager
 
-    If `GEMINI_API_KEY` or `GOOGLE_API_KEY` is configured and `prefer_live_api=True`, uses the
-    `google-genai` SDK with Sora's system instruction and automatic Python tool calling.
-    Otherwise, falls back cleanly to Sora's deterministic tool-assisted synthesis engine.
-    """
-    # Always enforce Japan-only scope first for non-Japan requests
-    scope = check_japan_destination_scope(prompt)
-    detected_japan_cities = _extract_cities_from_prompt(prompt)
-    if not scope["is_japan_only"] and not detected_japan_cities:
-        return render_tool_assisted_response(prompt)
+    with tracer.start_as_current_span(
+        "sora.request.arun_sora_query",
+        component="orchestrator",
+        attributes={"session_id": session_id, "prefer_live_api": prefer_live_api},
+    ) as root_span:
+        # 1. Input Guardrail & PII Scrubbing
+        input_eval = guardrail_engine.evaluate_input(prompt)
+        sanitized_prompt = input_eval.sanitized_prompt
+        detected_cities = _extract_cities_from_prompt(sanitized_prompt)
+        extracted_days = _extract_days_from_prompt(sanitized_prompt)
+        extracted_month = _extract_month_from_prompt(sanitized_prompt)
 
-    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    if prefer_live_api and api_key and api_key != "your_gemini_api_key_here":
-        try:
-            from google import genai
-            from google.genai import types
+        intent = intent_tracker.classify_intent(
+            sanitized_prompt,
+            session_id=session_id,
+            detected_japan_cities=detected_cities,
+            is_japan_only=input_eval.is_japan_only,
+            extracted_days=extracted_days,
+            extracted_month=extracted_month,
+        )
 
-            client = genai.Client(api_key=api_key)
-            response = client.models.generate_content(
-                model=model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=SORA_SYSTEM_PROMPT,
-                    tools=ALL_SORA_TOOLS,
-                    temperature=0.4,
+        # 2. Strategic Model Routing
+        routing = model_router.route_query(
+            sanitized_prompt,
+            detected_city_count=len(detected_cities),
+            requested_days=extracted_days,
+        )
+        selected_model = model or routing.selected_model
+        root_span.set_attribute("sora.selected_model", selected_model)
+        root_span.set_attribute("sora.intent_category", intent.intent_category)
+
+        # 3. Async Memory Context Retrieval + User Turn Persistence
+        context_window = await mem.abuild_context_window(session_id=session_id, current_query=sanitized_prompt)
+        await mem.aadd_turn(session_id=session_id, role="user", content=sanitized_prompt)
+
+        if not input_eval.allowed:
+            latency_ms = (time.perf_counter() - start_perf) * 1000.0
+            outcome_status = (
+                "GUARDRAIL_BLOCKED_SAFETY"
+                if input_eval.block_reason == "PROMPT_INJECTION"
+                else "GUARDRAIL_BLOCKED_SCOPE"
+            )
+            await mem.aadd_turn(session_id=session_id, role="assistant", content=input_eval.guardrail_message)
+            intent_tracker.record_outcome(
+                intent,
+                actual_tools_invoked=["check_japan_destination_scope"],
+                sub_agents_dispatched=["safety_and_critic_specialist"],
+                selected_model=selected_model,
+                outcome_status=outcome_status,
+                self_eval_score=1.0,
+                latency_ms=latency_ms,
+            )
+            return input_eval.guardrail_message
+
+        # 4. Resolve API Key from Google Cloud Secret Manager (with local fallback)
+        api_key, secret_meta = secret_manager_service.get_gemini_api_key()
+        root_span.set_attribute("sora.secret_source", secret_meta.source)
+
+        response_text: str | None = None
+        if prefer_live_api and api_key and not intent.requires_hitl_confirmation:
+            try:
+                from google import genai
+                from google.genai import types
+
+                augmented_prompt = (
+                    f"{context_window.formatted_context_prompt}\n\n### Current Traveler Request\n{sanitized_prompt}"
+                    if context_window.formatted_context_prompt
+                    else sanitized_prompt
+                )
+
+                def _call_gemini(target_model: str) -> str | None:
+                    client = genai.Client(api_key=api_key)
+                    resp = client.models.generate_content(
+                        model=target_model,
+                        contents=augmented_prompt,
+                        config=types.GenerateContentConfig(
+                            system_instruction=SORA_SYSTEM_PROMPT,
+                            tools=ALL_SORA_TOOLS,
+                            safety_settings=get_cloud_native_safety_settings(),
+                            temperature=0.4,
+                        ),
+                    )
+                    return resp.text if resp and resp.text else None
+
+                for candidate_model in [selected_model, *routing.fallback_models]:
+                    try:
+                        response_text = await asyncio.to_thread(_call_gemini, candidate_model)
+                        if response_text:
+                            selected_model = candidate_model
+                            break
+                    except Exception as model_exc:
+                        structured_logger.warning(
+                            f"Model {candidate_model} invocation failed, trying next fallback: {model_exc}",
+                            component="orchestrator",
+                            event_type="model_fallback",
+                            session_id=session_id,
+                        )
+            except Exception:
+                response_text = None
+
+        if not response_text:
+            response_text = await asyncio.to_thread(
+                render_tool_assisted_response,
+                sanitized_prompt,
+                memory_context_summary=context_window.formatted_context_prompt,
+            )
+
+        # 5. Agentic Self-Evaluation & Auto-Refinement Critic Pass
+        self_eval = guardrail_engine.self_evaluate_and_refine(
+            sanitized_prompt,
+            response_text,
+            is_itinerary_request=(intent.intent_category == "ITINERARY_PLANNING"),
+        )
+        final_response = self_eval.refined_response
+
+        # 6. Persist Assistant Turn & Record Intent-vs-Outcome Telemetry
+        await mem.aadd_turn(session_id=session_id, role="assistant", content=final_response)
+        latency_ms = (time.perf_counter() - start_perf) * 1000.0
+        final_status = (
+            "AWAITING_HITL_CONFIRMATION"
+            if intent.requires_hitl_confirmation or "Human-in-the-Loop Confirmation Required" in final_response
+            else "FULFILLED"
+        )
+        intent_tracker.record_outcome(
+            intent,
+            actual_tools_invoked=intent.expected_tools,
+            sub_agents_dispatched=[
+                "rail_and_transit_specialist",
+                "cultural_and_seasonal_specialist",
+                "itinerary_architect_specialist",
+                "safety_and_critic_specialist",
+            ],
+            selected_model=selected_model,
+            outcome_status=final_status,
+            self_eval_score=self_eval.overall_score,
+            latency_ms=latency_ms,
+        )
+        return final_response
+
+
+def run_sora_query(
+    prompt: str,
+    model: str | None = None,
+    prefer_live_api: bool = True,
+    session_id: str = "default",
+) -> str:
+    """Synchronous entrypoint wrapping `arun_sora_query` for CLI and standard script compatibility."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        # Executed inside an existing async event loop (e.g., FastAPI sync handler or async test)
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(
+                asyncio.run,
+                arun_sora_query(
+                    prompt,
+                    session_id=session_id,
+                    model=model,
+                    prefer_live_api=prefer_live_api,
                 ),
             )
-            if response and response.text:
-                return response.text
-        except Exception:
-            # Fall back to deterministic tool-assisted synthesis if network or key fails
-            pass
+            return future.result()
 
-    return render_tool_assisted_response(prompt)
+    return asyncio.run(
+        arun_sora_query(
+            prompt,
+            session_id=session_id,
+            model=model,
+            prefer_live_api=prefer_live_api,
+        )
+    )
 
 
 __all__ = [
     "SORA_ROLE_HEADER",
     "SORA_SYSTEM_PROMPT",
+    "arun_sora_query",
     "create_sora_agent",
+    "render_tool_assisted_response",
     "root_agent",
     "run_sora_query",
-    "render_tool_assisted_response",
 ]
